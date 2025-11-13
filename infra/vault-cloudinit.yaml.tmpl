@@ -1,0 +1,164 @@
+#cloud-config
+package_update: true
+
+write_files:
+  - path: /usr/local/bin/install_prereqs.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      tries=12
+      delay=10
+      i=1
+      while [ $i -le $tries ]; do
+        if sudo apt-get update -y && sudo apt-get install -y curl unzip jq; then
+          exit 0
+        fi
+        echo "[cloud-init] apt attempt $i/$tries failed; retrying in $${delay}s..."
+        sleep $delay
+        i=$((i+1))
+      done
+      echo "[cloud-init] apt install failed after retries" >&2
+      exit 1
+
+  - path: /usr/local/bin/install_vault.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      VAULT_VERSION="${vault_version}"
+      VAULT_USER="vault"
+      VAULT_GROUP="vault"
+      VAULT_DATA_DIR="/opt/vault/data"
+
+      # If api/cluster addrs are empty, derive from primary IP at boot
+      PRIMARY_IP="$(hostname -I | awk '{print $1}')"
+      API_ADDR="${vault_api_addr}"
+      CLUSTER_ADDR="${vault_cluster_addr}"
+      if [ -z "$${API_ADDR}" ]; then API_ADDR="http://$${PRIMARY_IP}:8200"; fi
+      if [ -z "$${CLUSTER_ADDR}" ]; then CLUSTER_ADDR="http://$${PRIMARY_IP}:8201"; fi
+
+      AZ_TENANT_ID="${tenant_id}"
+      AZ_KEYVAULT_NAME="${kv_name}"
+      AZ_KEY_NAME="${kv_key_name}"
+
+      VAULT_TLS_DISABLE="${vault_tls_disable}"
+
+      install_vault() {
+        if command -v vault >/dev/null 2>&1; then
+          echo "[cloud-init] Vault already installed: $(vault version)"
+          return
+        fi
+        echo "[cloud-init] Installing Vault $${VAULT_VERSION}..."
+        cd /tmp
+        curl -fsSLO "https://releases.hashicorp.com/vault/$${VAULT_VERSION}/vault_$${VAULT_VERSION}_linux_amd64.zip"
+        unzip -o "vault_$${VAULT_VERSION}_linux_amd64.zip" -d /usr/local/bin
+        chmod 0755 /usr/local/bin/vault
+        setcap cap_ipc_lock=+ep /usr/local/bin/vault
+        rm -f "vault_$${VAULT_VERSION}_linux_amd64.zip"
+
+        id -u "$${VAULT_USER}" >/dev/null 2>&1 || useradd --system --home /etc/vault.d --shell /bin/false "$${VAULT_USER}"
+        mkdir -p /etc/vault.d "$${VAULT_DATA_DIR}"
+        chown -R "$${VAULT_USER}:$${VAULT_GROUP}" /etc/vault.d "$${VAULT_DATA_DIR}"
+        chmod 0750 /etc/vault.d "$${VAULT_DATA_DIR}"
+      }
+
+      write_config() {
+        cat >/etc/vault.d/vault.hcl <<EOF
+      ui = true
+      disable_mlock = true
+
+      api_addr     = "$${API_ADDR}"
+      cluster_addr = "$${CLUSTER_ADDR}"
+
+      storage "raft" {
+        path    = "$${VAULT_DATA_DIR}"
+        node_id = "$(hostname -s)"
+      }
+      EOF
+
+        if [ "$${VAULT_TLS_DISABLE}" = "1" ]; then
+          cat >>/etc/vault.d/vault.hcl <<'EOF'
+      listener "tcp" {
+        address         = "0.0.0.0:8200"
+        cluster_address = "0.0.0.0:8201"
+        tls_disable     = "1"
+      }
+      EOF
+        else
+          : "$${VAULT_TLS_CERT_FILE:?VAULT_TLS_CERT_FILE not set}"
+          : "$${VAULT_TLS_KEY_FILE:?VAULT_TLS_KEY_FILE not set}"
+          cat >>/etc/vault.d/vault.hcl <<EOF
+      listener "tcp" {
+        address         = "0.0.0.0:8200"
+        cluster_address = "0.0.0.0:8201"
+        tls_disable     = "0"
+        tls_cert_file   = "$${VAULT_TLS_CERT_FILE}"
+        tls_key_file    = "$${VAULT_TLS_KEY_FILE}"
+      }
+      EOF
+        fi
+
+        cat >>/etc/vault.d/vault.hcl <<EOF
+
+      seal "azurekeyvault" {
+        tenant_id  = "${tenant_id}"
+        vault_name = "${kv_name}"
+        key_name   = "${kv_key_name}"
+      }
+      EOF
+
+        chown -R "$${VAULT_USER}:$${VAULT_GROUP}" /etc/vault.d
+        chmod 0640 /etc/vault.d/vault.hcl
+      }
+
+      write_systemd() {
+        cat >/etc/systemd/system/vault.service <<'EOF'
+      [Unit]
+      Description=HashiCorp Vault
+      Documentation=https://www.vaultproject.io/docs/
+      Requires=network-online.target
+      After=network-online.target
+
+      [Service]
+      User=vault
+      Group=vault
+      ProtectSystem=full
+      ProtectHome=read-only
+      PrivateTmp=yes
+      PrivateDevices=yes
+      SecureBits=keep-caps
+      AmbientCapabilities=CAP_IPC_LOCK
+      CapabilityBoundingSet=CAP_SYSLOG CAP_IPC_LOCK
+      NoNewPrivileges=true
+      ExecStart=/usr/local/bin/vault server -config=/etc/vault.d/vault.hcl
+      ExecReload=/bin/kill --signal HUP $MAINPID
+      Restart=on-failure
+      RestartSec=5
+      LimitMEMLOCK=infinity
+      StartLimitIntervalSec=60
+      StartLimitBurst=3
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+
+        systemctl daemon-reload
+        systemctl enable vault
+      }
+
+      main() {
+        install_vault
+        write_config
+        write_systemd
+        systemctl start vault || true
+      }
+
+      main
+
+runcmd:
+  - [ bash, -lc, "/usr/local/bin/install_prereqs.sh" ]
+  - [ bash, -lc, "/usr/local/bin/install_vault.sh" ]

@@ -1,0 +1,188 @@
+#cloud-config
+package_update: true
+
+write_files:
+  - path: /usr/local/bin/install_prereqs.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      tries=12
+      delay=10
+      i=1
+      while [ $i -le $tries ]; do
+        if sudo apt-get update -y && sudo apt-get install -y curl unzip jq; then
+          exit 0
+        fi
+        echo "[cloud-init] apt attempt $i/$tries failed; retrying in $${delay}s..."
+        sleep $delay
+        i=$((i+1))
+      done
+      echo "[cloud-init] apt install failed after retries" >&2
+      exit 1
+
+  - path: /usr/local/bin/install_consul_nomad.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      CONSUL_VERSION="${consul_version}"
+      NOMAD_VERSION="${nomad_version}"
+
+      CONSUL_USER="consul"
+      CONSUL_GROUP="consul"
+      NOMAD_USER="nomad"
+      NOMAD_GROUP="nomad"
+
+      CONSUL_DATA_DIR="/opt/consul"
+      NOMAD_DATA_DIR="/opt/nomad"
+
+      PRIVATE_IP="$(hostname -I | awk '{print $1}')"
+
+      install_consul() {
+        if command -v consul >/dev/null 2>&1; then
+          echo "[cloud-init] Consul already installed: $(consul version | head -n1)"
+          return
+        fi
+
+        echo "[cloud-init] Installing Consul $${CONSUL_VERSION}..."
+        cd /tmp
+        curl -fsSLO "https://releases.hashicorp.com/consul/$${CONSUL_VERSION}/consul_$${CONSUL_VERSION}_linux_amd64.zip"
+        unzip -o "consul_$${CONSUL_VERSION}_linux_amd64.zip" -d /usr/local/bin
+        chmod 0755 /usr/local/bin/consul
+        rm -f "consul_$${CONSUL_VERSION}_linux_amd64.zip"
+
+        id -u "$${CONSUL_USER}" >/dev/null 2>&1 || useradd --system --home /etc/consul.d --shell /bin/false "$${CONSUL_USER}"
+        mkdir -p "$${CONSUL_DATA_DIR}" /etc/consul.d
+        chown -R "$${CONSUL_USER}:$${CONSUL_GROUP}" "$${CONSUL_DATA_DIR}" /etc/consul.d
+        chmod 0750 "$${CONSUL_DATA_DIR}" /etc/consul.d
+
+        cat >/etc/consul.d/consul.hcl <<EOF
+      data_dir      = "$${CONSUL_DATA_DIR}"
+      bind_addr     = "$${PRIVATE_IP}"
+      advertise_addr= "$${PRIVATE_IP}"
+      client_addr   = "0.0.0.0"
+      retry_join    = ${consul_retry_join_json}
+      ui            = true
+      server        = ${consul_server}
+      EOF
+
+        chown -R "$${CONSUL_USER}:$${CONSUL_GROUP}" /etc/consul.d
+        chmod 0640 /etc/consul.d/consul.hcl
+
+        cat >/etc/systemd/system/consul.service <<'EOF'
+      [Unit]
+      Description=HashiCorp Consul Agent
+      Requires=network-online.target
+      After=network-online.target
+
+      [Service]
+      User=consul
+      Group=consul
+      ExecStartPre=/bin/sleep 8
+      ExecStart=/usr/local/bin/consul agent -config-dir=/etc/consul.d
+      ExecReload=/bin/kill --signal HUP $MAINPID
+      KillMode=process
+      Restart=on-failure
+      LimitNOFILE=65536
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+
+        systemctl daemon-reload
+        systemctl enable consul
+      }
+
+      install_nomad() {
+        if command -v nomad >/dev/null 2>&1; then
+          echo "[cloud-init] Nomad already installed: $(nomad version | head -n1)"
+          return
+        fi
+
+        echo "[cloud-init] Installing Nomad $${NOMAD_VERSION}..."
+        cd /tmp
+        curl -fsSLO "https://releases.hashicorp.com/nomad/$${NOMAD_VERSION}/nomad_$${NOMAD_VERSION}_linux_amd64.zip"
+        unzip -o "nomad_$${NOMAD_VERSION}_linux_amd64.zip" -d /usr/local/bin
+        chmod 0755 /usr/local/bin/nomad
+        rm -f "nomad_$${NOMAD_VERSION}_linux_amd64.zip"
+
+        id -u "$${NOMAD_USER}" >/dev/null 2>&1 || useradd --system --home /etc/nomad.d --shell /bin/false "$${NOMAD_USER}"
+        mkdir -p "$${NOMAD_DATA_DIR}" /etc/nomad.d
+        chown -R "$${NOMAD_USER}:$${NOMAD_GROUP}" "$${NOMAD_DATA_DIR}" /etc/nomad.d
+        chmod 0750 "$${NOMAD_DATA_DIR}" /etc/nomad.d
+
+        cat >/etc/nomad.d/nomad.hcl <<EOF
+      data_dir  = "$${NOMAD_DATA_DIR}"
+      bind_addr = "0.0.0.0"
+      advertise {
+        http = "$${PRIVATE_IP}"
+        rpc  = "$${PRIVATE_IP}"
+        serf = "$${PRIVATE_IP}"
+      }
+      client {
+        enabled = true
+        network_interface = "eth0"
+      }
+      server {
+        enabled = ${nomad_server_enabled}
+        bootstrap_expect = ${nomad_bootstrap_expect}
+      }
+      consul {
+        address = "127.0.0.1:8500"
+      }
+      EOF
+
+        chown -R "$${NOMAD_USER}:$${NOMAD_GROUP}" /etc/nomad.d
+        chmod 0640 /etc/nomad.d/nomad.hcl
+
+        cat >/etc/systemd/system/nomad.service <<'EOF'
+      [Unit]
+      Description=HashiCorp Nomad Agent
+      Requires=network-online.target
+      After=network-online.target
+
+      [Service]
+      User=nomad
+      Group=nomad
+      ExecStartPre=/bin/sleep 8
+      ExecStart=/usr/local/bin/nomad agent -config=/etc/nomad.d
+      ExecReload=/bin/kill --signal HUP $MAINPID
+      KillMode=process
+      Restart=on-failure
+      LimitNOFILE=65536
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+
+        systemctl daemon-reload
+        systemctl enable nomad
+      }
+
+      main() {
+        install_consul
+        install_nomad
+
+        # Ensure alloc dir exists
+        mkdir -p /opt/alloc_mounts
+        chown -R nomad:nomad /opt/alloc_mounts
+        chmod 0755 /opt/alloc_mounts
+
+        # Give network and peers some time
+        sleep 10
+
+        systemctl start consul || true
+
+        sleep 6
+        systemctl start nomad || true
+      }
+
+      main
+
+runcmd:
+  - [ bash, -lc, "/usr/local/bin/install_prereqs.sh" ]
+  - [ bash, -lc, "/usr/local/bin/install_consul_nomad.sh" ]
