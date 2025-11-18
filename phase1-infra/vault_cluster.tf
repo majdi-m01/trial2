@@ -4,24 +4,24 @@ locals {
   # api_addr → clients talk to LB (HA) or local IP (single node)
   vault_api_addr = var.vault_instance_count > 1 ? (
     "http://${azurerm_lb.vault_lb[0].frontend_ip_configuration[0].private_ip_address}:8200"
-  ) : "http://__LOCAL_IP__:8200"
+  ) : "http://$(hostname -I | awk '{print $1}' | tr -d ' '):8200"
 
-  # cluster_addr → set a placeholder, resolved at boot (Raft requires node-local IP)
-  vault_cluster_addr = "http://__LOCAL_IP__:8201"
+  # cluster_addr → MUST be node-local IP:port for Raft peering
+  vault_cluster_addr = "http://$(hostname -I | awk '{print $1}' | tr -d ' '):8201"
 
   vault_hcl = templatefile("${path.module}/cloud-init/vault.hcl.tpl", {
-    api_addr       = local.vault_api_addr
-    cluster_addr   = local.vault_cluster_addr
-    tenant_id      = data.azurerm_client_config.current.tenant_id
+    api_addr      = local.vault_api_addr
+    cluster_addr  = local.vault_cluster_addr
+    tenant_id     = data.azurerm_client_config.current.tenant_id
     key_vault_name = azurerm_key_vault.main.name
-    key_name       = azurerm_key_vault_key.vault_unseal_key.name
+    key_name      = azurerm_key_vault_key.vault_unseal_key.name
     resource_group_name = azurerm_resource_group.vault_rg.name
     subscription_id     = data.azurerm_client_config.current.subscription_id
+
   })
 
   vault_service = file("${path.module}/cloud-init/vault.service")
 }
-
 
 # Resource Group and VNet
 resource "azurerm_resource_group" "vault_rg" {
