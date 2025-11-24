@@ -1,0 +1,16 @@
+[Unit]
+Description=Nomad
+Documentation=https://nomadproject.io/docs/
+Requires=network-online.target consul.service
+After=network-online.target consul.service
+
+[Service]
+User=nomad
+Group=nomad
+ExecStart=/usr/local/bin/nomad agent -config-dir=/etc/nomad.d/
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=process
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
