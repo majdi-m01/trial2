@@ -216,6 +216,10 @@ resource "azurerm_linux_virtual_machine_scale_set" "nomad_consul_vmss" {
   admin_password      = var.admin_password
   overprovision       = false
 
+  identity {
+    type = "SystemAssigned"
+  }
+
   source_image_reference {
     publisher = var.nomad_consul_image_publisher
     offer     = var.nomad_consul_image_offer
@@ -253,4 +257,11 @@ resource "azurerm_linux_virtual_machine_scale_set" "nomad_consul_vmss" {
   tags = merge(var.tags, {
     ConsulCluster = "nomad-consul-servers"   # for future tag-based auto-join
   })
+}
+
+
+resource "azurerm_role_assignment" "consul_vmss_monitoring_reader" {
+  scope                = azurerm_resource_group.nomad_consul_rg.id
+  role_definition_name = "Monitoring Reader"
+  principal_id         = azurerm_linux_virtual_machine_scale_set.nomad_consul_vmss.identity[0].principal_id
 }
